@@ -1,15 +1,186 @@
-{
-	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "s",
-	"main": "./src/worker/index.ts",
-	"compatibility_date": "2025-10-08",
-	"compatibility_flags": ["nodejs_compat"],
-	"observability": {
-		"enabled": true
-	},
-	"upload_source_maps": true,
-	"assets": {
-		"directory": "./dist/client",
-		"not_found_handling": "single-page-application"
-	}
-}
+export default {
+  async fetch(request) {
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*' } });
+    }
+ 
+    try {
+      const body = await request.json();
+      const isStream = body.stream === true;
+      
+      const rawModel = body.model || 'gemini-3.1-flash-lite-preview';
+      const model = String(rawModel).replace(/^models\//, '').trim();
+ 
+      // gemini-3.5-flash has stricter defaults + a new CIVIC_INTEGRITY category
+      // that causes extra blocking. Apply extended bypass only for this model.
+      const isGemini35Flash = model === 'gemini-3.5-flash';
+ 
+      // 3.5-flash supports up to 65k output tokens
+      const maxTokens = isGemini35Flash ? 65536 : 8192;
+ 
+      let systemInstructionText = "";
+      let contents = [];
+      
+      for (const msg of body.messages || []) {
+        if (msg.role === 'system') {
+          systemInstructionText += msg.content + "\n";
+        } else {
+          const mappedRole = msg.role === 'assistant' ? 'model' : 'user';
+          if (contents.length > 0 && contents[contents.length - 1].role === mappedRole) {
+            contents[contents.length - 1].parts[0].text += "\n\n" + msg.content;
+          } else {
+            contents.push({ role: mappedRole, parts: [{ text: msg.content }] });
+          }
+        }
+      }
+ 
+      if (systemInstructionText.trim() !== "") {
+        const smuggledPrompt = `[System Context/Character Definition:\n${systemInstructionText.trim()}]\n\n`;
+        if (contents.length > 0 && contents[0].role === 'user') {
+          contents[0].parts[0].text = smuggledPrompt + contents[0].parts[0].text;
+        } else {
+          contents.unshift({ role: 'user', parts: [{ text: smuggledPrompt }] });
+        }
+      }
+ 
+      // Base safety settings for all older models (working fine already)
+      const baseSafetySettings = [
+        { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+        { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+        { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+        { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+      ];
+ 
+      // gemini-3.5-flash has an extra CIVIC_INTEGRITY category not present in older models.
+      // Without this, 3.5-flash will block a lot more content even with the others set to BLOCK_NONE.
+      const extendedSafetySettings = [
+        ...baseSafetySettings,
+        { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" }
+      ];
+ 
+      const safetySettings = isGemini35Flash ? extendedSafetySettings : baseSafetySettings;
+ 
+      // For 3.5-flash: disable thinking (thinkingBudget: 0) — faster responses,
+      // avoids the model second-guessing itself into a refusal.
+      const generationConfig = {
+        temperature: body.temperature || 0.8,
+        maxOutputTokens: maxTokens,
+        ...(isGemini35Flash ? { thinkingConfig: { thinkingBudget: 0 } } : {})
+      };
+ 
+      const geminiPayload = {
+        contents: contents,
+        safetySettings: safetySettings,
+        generationConfig: generationConfig
+      };
+ 
+      const authHeader = request.headers.get('Authorization') || '';
+      const apiKey = authHeader.replace('Bearer ', '').trim();
+ 
+      if (isStream) {
+        const targetUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
+        const response = await fetch(targetUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(geminiPayload) });
+ 
+        if (!response.ok) {
+          const errorData = await response.json();
+          const errorMsg = errorData.error?.message || "Unknown Google API Error";
+          return new Response(JSON.stringify({ error: { message: `[GOOGLE API BLOCKED IT]: ${errorMsg}` } }), { 
+            status: 400, 
+            headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' } 
+          });
+        }
+ 
+        const { readable, writable } = new TransformStream();
+        const writer = writable.getWriter();
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        const encoder = new TextEncoder();
+ 
+        (async () => {
+          try {
+            let buffer = "";
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop();
+ 
+              for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                  const dataStr = line.replace('data: ', '').trim();
+                  if (!dataStr) continue;
+                  try {
+                    const dataObj = JSON.parse(dataStr);
+                    let textPart = "";
+                    if (dataObj.candidates?.[0]?.content?.parts) {
+                      // 3.5-flash may return multiple parts (thinking + output).
+                      // We only want actual text output, not internal thought parts.
+                      for (const part of dataObj.candidates[0].content.parts) {
+                        if (part.text && !part.thought) {
+                          textPart += part.text;
+                        }
+                      }
+                    }
+                    if (textPart) {
+                      const chunk = {
+                        id: "chatcmpl-" + Date.now(),
+                        object: "chat.completion.chunk",
+                        created: Math.floor(Date.now() / 1000),
+                        model: model,
+                        choices: [{ index: 0, delta: { content: textPart }, finish_reason: null }]
+                      };
+                      await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                    }
+                  } catch (e) {}
+                }
+              }
+            }
+            await writer.write(encoder.encode("data: [DONE]\n\n"));
+            await writer.close();
+          } catch (e) {
+            await writer.abort(e);
+          }
+        })();
+ 
+        return new Response(readable, { headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/event-stream' } });
+ 
+      } else {
+        const targetUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+        const response = await fetch(targetUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(geminiPayload) });
+ 
+        if (!response.ok) {
+          const errorData = await response.json();
+          const errorMsg = errorData.error?.message || "Unknown Google API Error";
+          return new Response(JSON.stringify({ error: { message: `[GOOGLE API BLOCKED IT]: ${errorMsg}` } }), { 
+            status: 400, 
+            headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' } 
+          });
+        }
+ 
+        const data = await response.json();
+ 
+        // 3.5-flash may return multiple parts — filter out thought parts
+        let replyText = "";
+        const parts = data.candidates?.[0]?.content?.parts || [];
+        for (const part of parts) {
+          if (part.text && !part.thought) {
+            replyText += part.text;
+          }
+        }
+ 
+        const openaiResponse = {
+          id: "chatcmpl-" + Date.now(),
+          object: "chat.completion",
+          created: Math.floor(Date.now() / 1000),
+          model: model,
+          choices: [{ index: 0, message: { role: "assistant", content: replyText }, finish_reason: "stop" }]
+        };
+        return new Response(JSON.stringify(openaiResponse), { headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' } });
+      }
+ 
+    } catch (e) {
+      return new Response(JSON.stringify({ error: { message: e.message } }), { status: 500, headers: { 'Access-Control-Allow-Origin': '*' } });
+    }
+  }
+};
